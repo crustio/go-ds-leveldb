@@ -1,10 +1,15 @@
 package leveldb
 
 import (
+	"fmt"
+	"math/rand"
 	"os"
 	"path/filepath"
 	"sync"
+	"time"
 
+	crust "github.com/crustio/go-ipfs-encryptor/crust"
+	"github.com/ipfs/go-datastore"
 	ds "github.com/ipfs/go-datastore"
 	dsq "github.com/ipfs/go-datastore/query"
 	"github.com/syndtr/goleveldb/leveldb"
@@ -19,6 +24,10 @@ type Datastore struct {
 	*accessor
 	DB   *leveldb.DB
 	path string
+}
+
+func init() {
+	rand.Seed(time.Now().UTC().UnixNano())
 }
 
 var _ ds.Datastore = (*Datastore)(nil)
@@ -82,6 +91,26 @@ type accessor struct {
 func (a *accessor) Put(key ds.Key, value []byte) (err error) {
 	a.closeLk.RLock()
 	defer a.closeLk.RUnlock()
+
+	if ok, sb := crust.TryGetSealedBlock(value); ok {
+		// fmt.Printf("Sb: {path: %s, size: %d}\n", sb.Path, sb.Size)
+		data, err := a.GetRaw(key)
+		if err == datastore.ErrNotFound {
+			return a.ldb.Put(key.Bytes(), sb.ToSealedInfo().Bytes(), &opt.WriteOptions{Sync: a.syncWrites})
+		} else if err != nil {
+			return err
+		}
+
+		if ok, si := crust.TryGetSealedInfo(data); !ok {
+			return a.ldb.Put(key.Bytes(), sb.ToSealedInfo().Bytes(), &opt.WriteOptions{Sync: a.syncWrites})
+		} else {
+			// for i := 0; i < len(si.Sbs); i++ {
+			// fmt.Printf("Sbs[%d]: {path: %s, size: %d}\n", i, si.Sbs[i].Path, si.Sbs[i].Size)
+			// }
+			return a.ldb.Put(key.Bytes(), si.AddSealedBlock(*sb).Bytes(), &opt.WriteOptions{Sync: a.syncWrites})
+		}
+	}
+
 	return a.ldb.Put(key.Bytes(), value, &opt.WriteOptions{Sync: a.syncWrites})
 }
 
@@ -89,7 +118,7 @@ func (a *accessor) Sync(prefix ds.Key) error {
 	return nil
 }
 
-func (a *accessor) Get(key ds.Key) (value []byte, err error) {
+func (a *accessor) GetRaw(key ds.Key) (value []byte, err error) {
 	a.closeLk.RLock()
 	defer a.closeLk.RUnlock()
 	val, err := a.ldb.Get(key.Bytes(), nil)
@@ -102,6 +131,67 @@ func (a *accessor) Get(key ds.Key) (value []byte, err error) {
 	return val, nil
 }
 
+func (a *accessor) Get(key ds.Key) (value []byte, err error) {
+	a.closeLk.RLock()
+	defer a.closeLk.RUnlock()
+	val, err := a.ldb.Get(key.Bytes(), nil)
+	if err != nil {
+		if err == leveldb.ErrNotFound {
+			return nil, ds.ErrNotFound
+		}
+		return nil, err
+	}
+
+	if ok, si := crust.TryGetSealedInfo(val); ok {
+		sbsLen := len(si.Sbs)
+		if sbsLen == 0 {
+			return nil, ds.ErrNotFound
+		}
+
+		rindex := rand.Intn(sbsLen)
+
+		var ret []byte
+		var code int
+		for i := rindex; i < len(si.Sbs)+rindex; {
+			nowi := i % len(si.Sbs)
+			ret, err, code = crust.Unseal(si.Sbs[nowi].Path)
+			if err != nil {
+				switch code {
+				case 200:
+					return ret, nil
+				// Can't find
+				case 404:
+					si.Sbs = append(si.Sbs[:nowi], si.Sbs[nowi+1:]...)
+					continue
+				// Lost
+				case 410:
+					i++
+					continue
+				default:
+					return nil, err
+				}
+			} else {
+				break
+			}
+		}
+
+		if sbsLen != len(si.Sbs) {
+			err = a.Put(key, si.Bytes())
+			if err != nil {
+				return nil, err
+			}
+		}
+
+		if ret == nil {
+			return nil, ds.ErrNotFound
+		} else {
+			return ret, nil
+		}
+	}
+
+	return val, nil
+}
+
 func (a *accessor) Has(key ds.Key) (exists bool, err error) {
 	a.closeLk.RLock()
 	defer a.closeLk.RUnlock()
@@ -109,7 +199,19 @@ func (a *accessor) Has(key ds.Key) (exists bool, err error) {
 }
 
 func (a *accessor) GetSize(key ds.Key) (size int, err error) {
-	return ds.GetBackedSize(a, key)
+	value, err := a.GetRaw(key)
+	if err != nil {
+		return -1, err
+	}
+
+	if ok, si := crust.TryGetSealedInfo(value); ok {
+		if len(si.Sbs) == 0 {
+			return 0, fmt.Errorf("Sbs is empty, can't get block size")
+		}
+		return si.Sbs[0].Size, nil
+	}
+
+	return len(value), nil
 }
 
 func (a *accessor) Delete(key ds.Key) (err error) {
